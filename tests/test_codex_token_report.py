@@ -88,11 +88,13 @@ class CodexTokenReportTests(unittest.TestCase):
         self.assertIn('data-column="5"', report)
         self.assertIn("sort-caret", report)
         self.assertIn('name="codex-total-tokens"', report)
+        self.assertIn('name="codex-report-data-version"', report)
         self.assertIn('id="refresh-report-button"', report)
         self.assertIn("setupRefreshButton", report)
         self.assertIn("/__refresh__", report)
         self.assertIn("codexTokenRefreshNotice", report)
         self.assertIn("刷新完成，相较上次 total_tokens 增量", report)
+        self.assertIn("多个 rollout 文件，脚本会自动合并去重", report)
         self.assertIn("--serve", report)
         self.assertIn('id="daily-pagination"', report)
         self.assertIn('id="session-pagination"', report)
@@ -156,7 +158,7 @@ class CodexTokenReportTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        self.assertEqual(8814300754, target.read_previous_total_tokens(report_path))
+        self.assertEqual((None, False), target.read_previous_report_state(report_path))
 
     def test_build_console_summary_lines_matches_expected_style(self):
         lines = target.build_console_summary_lines(
@@ -239,6 +241,33 @@ class CodexTokenReportTests(unittest.TestCase):
         self.assertEqual("单次扫描测试标题", sessions[0].title)
         self.assertEqual(14, daily_usage["2026-04-01"].total_tokens)
 
+    def test_collect_report_data_deduplicates_same_session_id_across_rollout_files(self):
+        self.write_jsonl(
+            "2026/04/part-1.jsonl",
+            [
+                '{"type":"session_meta","payload":{"id":"session-dup","timestamp":"2026-04-16T01:00:00Z","model_provider":"sgproxy"}}',
+                '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"重复会话去重测试"}]}}',
+                '{"timestamp":"2026-04-16T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":10}}}}',
+                '{"timestamp":"2026-04-16T01:10:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":20}}}}',
+            ],
+        )
+        self.write_jsonl(
+            "2026/04/part-2.jsonl",
+            [
+                '{"type":"session_meta","payload":{"id":"session-dup","timestamp":"2026-04-16T01:05:00Z","model_provider":"sgproxy"}}',
+                '{"timestamp":"2026-04-16T01:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":10}}}}',
+                '{"timestamp":"2026-04-16T01:15:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":25}}}}',
+            ],
+        )
+
+        session_files, sessions, daily_usage = target.collect_report_data(self.root)
+
+        self.assertEqual(2, len(session_files))
+        self.assertEqual(1, len(sessions))
+        self.assertEqual("session-dup", sessions[0].session_id)
+        self.assertEqual(25, sessions[0].total_tokens)
+        self.assertEqual(25, daily_usage["2026-04-16"].total_tokens)
+
     def test_build_recent_day_summary_lines_matches_expected_style(self):
         lines = target.build_recent_day_summary_lines("45,547,820", "18,478,575")
 
@@ -269,6 +298,12 @@ class CodexTokenReportTests(unittest.TestCase):
         )
 
         self.assertEqual("123", result.total_tokens_delta)
+
+    def test_format_total_tokens_delta_returns_version_notice_when_not_comparable(self):
+        self.assertEqual(
+            "-（统计口径已更新）",
+            target.format_total_tokens_delta(100, 50, comparable=False),
+        )
 
 
 if __name__ == "__main__":

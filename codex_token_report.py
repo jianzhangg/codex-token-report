@@ -18,6 +18,8 @@ from typing import Any
 
 REPORT_FILENAME = "total-usage-report.html"
 TOTAL_TOKENS_META_NAME = "codex-total-tokens"
+REPORT_DATA_VERSION = "2"
+REPORT_DATA_VERSION_META_NAME = "codex-report-data-version"
 
 
 @dataclass
@@ -49,6 +51,19 @@ class Totals:
     output_tokens: int = 0
     reasoning_output_tokens: int = 0
     total_tokens: int = 0
+
+
+@dataclass
+class TokenCountEvent:
+    timestamp: datetime
+    totals: Totals
+    last_totals: Totals | None = None
+
+
+@dataclass
+class SessionRolloutData:
+    session: SessionUsage
+    events: list[TokenCountEvent]
 
 
 @dataclass
@@ -318,25 +333,43 @@ def resolve_day_spec(value: str | None) -> str | None:
         raise SystemExit(f"无效的 --day 参数：{value}。请使用 today、yesterday 或 YYYY-MM-DD。") from exc
 
 
-def read_previous_total_tokens(report_path: Path) -> int | None:
+def read_previous_report_state(report_path: Path) -> tuple[int | None, bool]:
     if not report_path.exists():
-        return None
+        return None, True
 
     text = report_path.read_text(encoding="utf-8", errors="replace")
+    version_pattern = rf'<meta\s+name="{re.escape(REPORT_DATA_VERSION_META_NAME)}"\s+content="(?P<value>[^"]+)">'
+    version_match = re.search(version_pattern, text)
+    if version_match and version_match.group("value") != REPORT_DATA_VERSION:
+        return None, False
+    if version_match is None:
+        return None, False
+
     meta_pattern = (
         rf'<meta\s+name="{re.escape(TOTAL_TOKENS_META_NAME)}"\s+content="(?P<value>\d+)">'
     )
     meta_match = re.search(meta_pattern, text)
     if meta_match:
-        return int(meta_match.group("value"))
+        return int(meta_match.group("value")), True
 
     parser = SummaryTableParser()
     parser.feed(text)
     summary = dict(zip(parser.headers, parser.values))
-    return parse_formatted_number(summary.get("汇总 total_tokens", ""))
+    return parse_formatted_number(summary.get("汇总 total_tokens", "")), True
 
 
-def format_total_tokens_delta(current_total: int, previous_total: int | None) -> str:
+def read_previous_total_tokens(report_path: Path) -> int | None:
+    previous_total_tokens, _ = read_previous_report_state(report_path)
+    return previous_total_tokens
+
+
+def format_total_tokens_delta(
+    current_total: int,
+    previous_total: int | None,
+    comparable: bool = True,
+) -> str:
+    if not comparable:
+        return "-（统计口径已更新）"
     if previous_total is None:
         return "-（未找到上次报告）"
 
@@ -348,10 +381,9 @@ def iter_session_files(sessions_root: Path) -> list[Path]:
     return sorted(path for path in sessions_root.rglob("*.jsonl") if path.is_file())
 
 
-def parse_session_file_data(path: Path) -> tuple[SessionUsage, dict[str, Totals]]:
+def parse_session_file_data(path: Path) -> SessionRolloutData:
     session = SessionUsage(file=path)
-    daily_usage: dict[str, Totals] = defaultdict(Totals)
-    previous_totals: Totals | None = None
+    events: list[TokenCountEvent] = []
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for raw_line in handle:
             line = raw_line.strip()
@@ -416,36 +448,116 @@ def parse_session_file_data(path: Path) -> tuple[SessionUsage, dict[str, Totals]
             )
             session.total_tokens = max(session.total_tokens, safe_int(usage.get("total_tokens")))
 
-            current_totals = build_totals_from_usage(usage)
-            delta_totals = subtract_totals(current_totals, previous_totals)
-            if has_negative_totals(delta_totals):
-                delta_totals = build_totals_from_usage(info.get("last_token_usage"))
+            event_timestamp = parse_timestamp(str(record.get("timestamp") or ""))
+            if event_timestamp is None:
+                continue
 
-            day = parse_local_day(str(record.get("timestamp") or ""))
-            if day and has_positive_totals(delta_totals):
-                add_totals(daily_usage[day], delta_totals)
-
-            if has_positive_totals(current_totals):
-                previous_totals = current_totals
-    return session, dict(daily_usage)
+            events.append(
+                TokenCountEvent(
+                    timestamp=event_timestamp,
+                    totals=build_totals_from_usage(usage),
+                    last_totals=build_totals_from_usage(info.get("last_token_usage"))
+                    if info.get("last_token_usage") is not None
+                    else None,
+                )
+            )
+    return SessionRolloutData(session=session, events=events)
 
 
 def parse_session_file(path: Path) -> SessionUsage:
-    session, _ = parse_session_file_data(path)
-    return session
+    return parse_session_file_data(path).session
+
+
+def build_session_group_key(session: SessionUsage) -> str:
+    return session.session_id or str(session.file)
+
+
+def merge_session_rollouts(
+    rollouts: list[SessionRolloutData],
+) -> tuple[SessionUsage, dict[str, Totals]]:
+    first_session = rollouts[0].session
+    merged = SessionUsage(
+        file=first_session.file,
+        session_id=first_session.session_id,
+        title=first_session.title,
+        provider=first_session.provider,
+        timestamp=first_session.timestamp,
+        cwd=first_session.cwd,
+        source=first_session.source,
+        cli_version=first_session.cli_version,
+        parse_errors=0,
+    )
+    daily_usage: dict[str, Totals] = defaultdict(Totals)
+    previous_totals: Totals | None = None
+    all_events: list[TokenCountEvent] = []
+
+    for rollout in rollouts:
+        session = rollout.session
+        merged.parse_errors += session.parse_errors
+        if session.timestamp and (
+            merged.timestamp is None or session.timestamp < merged.timestamp
+        ):
+            merged.timestamp = session.timestamp
+            merged.file = session.file
+        if not merged.title and session.title:
+            merged.title = session.title
+        if not merged.provider and session.provider:
+            merged.provider = session.provider
+        if not merged.cwd and session.cwd:
+            merged.cwd = session.cwd
+        if not merged.source and session.source:
+            merged.source = session.source
+        if not merged.cli_version and session.cli_version:
+            merged.cli_version = session.cli_version
+
+        merged.input_tokens = max(merged.input_tokens, session.input_tokens)
+        merged.cached_input_tokens = max(
+            merged.cached_input_tokens, session.cached_input_tokens
+        )
+        merged.output_tokens = max(merged.output_tokens, session.output_tokens)
+        merged.reasoning_output_tokens = max(
+            merged.reasoning_output_tokens, session.reasoning_output_tokens
+        )
+        merged.total_tokens = max(merged.total_tokens, session.total_tokens)
+        all_events.extend(rollout.events)
+
+    for event in sorted(all_events, key=lambda item: (item.timestamp, item.totals.total_tokens)):
+        current_totals = event.totals
+        delta_totals = subtract_totals(current_totals, previous_totals)
+        if delta_totals.total_tokens < 0:
+            continue
+        if has_negative_totals(delta_totals):
+            if event.last_totals and has_positive_totals(event.last_totals):
+                delta_totals = event.last_totals
+            else:
+                continue
+
+        day = event.timestamp.astimezone().date().isoformat()
+        if has_positive_totals(delta_totals):
+            add_totals(daily_usage[day], delta_totals)
+
+        if previous_totals is None or current_totals.total_tokens > previous_totals.total_tokens:
+            previous_totals = current_totals
+    return merged, dict(daily_usage)
 
 
 def collect_report_data(
     sessions_root: Path,
 ) -> tuple[list[Path], list[SessionUsage], dict[str, Totals]]:
     session_files = iter_session_files(sessions_root)
-    sessions: list[SessionUsage] = []
+    rollout_groups: dict[str, list[SessionRolloutData]] = defaultdict(list)
     daily_usage: dict[str, Totals] = defaultdict(Totals)
 
     for path in session_files:
-        session, session_daily_usage = parse_session_file_data(path)
-        if session.provider:
-            sessions.append(session)
+        rollout = parse_session_file_data(path)
+        if not rollout.session.provider:
+            continue
+        rollout_groups[build_session_group_key(rollout.session)].append(rollout)
+
+    sessions: list[SessionUsage] = []
+    for rollouts in rollout_groups.values():
+        session, session_daily_usage = merge_session_rollouts(rollouts)
+        sessions.append(session)
         for day, totals in session_daily_usage.items():
             add_totals(daily_usage[day], totals)
     return session_files, sessions, dict(daily_usage)
@@ -714,6 +826,7 @@ def build_report_html(
         "<head>",
         '  <meta charset="utf-8">',
         '  <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        f'  <meta name="{REPORT_DATA_VERSION_META_NAME}" content="{REPORT_DATA_VERSION}">',
         f'  <meta name="{TOTAL_TOKENS_META_NAME}" content="{totals.total_tokens}">',
         "  <title>Codex Token 使用报告</title>",
         "  <style>",
@@ -860,7 +973,7 @@ def build_report_html(
         "      </div>",
         "    </div>",
         *["    " + line for line in render_summary_row_table(summary_rows)],
-        f'    <p class="note">会话目录：<code>{escape_html(str(sessions_root))}</code>；按天统计使用 `token_count` 事件的本地时间做归属，并按同一会话的累计值差分计算，所以旧会话在今天继续编辑时，新增 token 会计入今天。标题取自首条用户消息，长度过长会自动截断。点击明细表表头可按该列升序 / 降序排序。若要在页面里直接点“刷新”重跑脚本，请用本脚本的 `--serve` 模式打开报告。</p>',
+        f'    <p class="note">会话目录：<code>{escape_html(str(sessions_root))}</code>；按天统计使用 `token_count` 事件的本地时间做归属，并按同一逻辑会话的累计值差分计算，所以旧会话在今天继续编辑时，新增 token 会计入今天；如果同一个 `session_id` 被拆成多个 rollout 文件，脚本会自动合并去重。标题取自首条用户消息，长度过长会自动截断。点击明细表表头可按该列升序 / 降序排序。若要在页面里直接点“刷新”重跑脚本，请用本脚本的 `--serve` 模式打开报告。</p>',
         "    <h2>按天统计</h2>",
         *["    " + line for line in render_daily_usage_table(daily_usage)],
         "    <h2>会话明细</h2>",
@@ -1143,7 +1256,7 @@ def cleanup_old_reports(script_dir: Path, keep_path: Path) -> None:
 def generate_report(script_dir: Path, sessions_root: Path) -> ReportGenerationResult:
     session_files, sessions, daily_usage = collect_report_data(sessions_root)
     report_path = build_output_path(script_dir)
-    previous_total_tokens = read_previous_total_tokens(report_path)
+    previous_total_tokens, comparable = read_previous_report_state(report_path)
     cleanup_old_reports(script_dir, report_path)
 
     html_report = build_report_html(
@@ -1157,7 +1270,7 @@ def generate_report(script_dir: Path, sessions_root: Path) -> ReportGenerationRe
     summary_rows = make_summary_rows(len(session_files), sessions)
     current_totals = sum_totals(sessions)
     total_tokens_delta = format_total_tokens_delta(
-        current_totals.total_tokens, previous_total_tokens
+        current_totals.total_tokens, previous_total_tokens, comparable=comparable
     )
     return ReportGenerationResult(
         report_path=report_path,
